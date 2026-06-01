@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OpenModSim Version="2.0.0-beta2">
+    <ModbusDefinitions AddrSpace="6-Digits" UseGlobalUnitMap="false" AutoAddRegistersOnRequest="false">
+        <ModbusErrorSimulations NoResponse="false" ResponseIncorrectId="false" ResponseIllegalFunction="false" ResponseDeviceBusy="false" ResponseIncorrectCrc="false" ResponseDelay="false" ResponseRandomDelay="false" ResponseDelayTime="0" ResponseRandomDelayUpToTime="1000"/>
+    </ModbusDefinitions>
+    <Connections/>
+    <AddressSpace>
+        <AddressDescriptionMap/>
+        <AddressTimestampMap/>
+        <ModbusSimulationMap/>
+        <ModbusDataValues/>
+    </AddressSpace>
+    <ViewSettings ViewMode="1" SplitView="0" GlobalZeroBasedAddress="0" GlobalHexView="0" ActivePanel="L" ActivePrimaryWindow="Data1"/>
+    <Forms>
+        <FormDataView Panel="L" Title="Data1" DataType="Hex" RegisterOrder="MSRF" Codepage="" ByteOrder="Direct">
+            <Window Maximized="true" Minimized="false" Left="0" Top="0" Width="610" Height="314"/>
+            <DataViewDefinitions FormName="Data1" DeviceId="1" PointType="HoldingRegisters" PointAddress="1" Length="100" DataViewColumnsDistance="16" LeadingZeros="true"/>
+            <AddressColorMap/>
+        </FormDataView>
+    </Forms>
+    <TabOrder Panel="L">
+        <TabRef title="Data1"/>
+    </TabOrder>
+</OpenModSim>
