@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  OpenADR 2.0b Message Template
+  Stored on Opta flash at /fs/openadr_template.xml
+
+  Placeholder tokens replaced at runtime - never written back to flash.
+  Token list:
+    {{VEN_ID}}          - VEN identifier, e.g. 1234
+    {{VTN_ID}}          - VTN identifier, e.g. test-vtn
+    {{REQUEST_ID}}      - Unique request ID, incremented each poll
+    {{EVENT_ID}}        - Event ID echoed from VTN event
+    {{OPT_TYPE}}        - optIn or optOut
+    {{REPORT_ID}}       - Unique report ID
+    {{REPORT_VALUE}}    - Actual load shed value reported back to VTN
+    {{SIGNAL_PAYLOAD}}  - Signal level received from VTN (0,1,2,3)
+-->
+
+<!-- ==================================================================================
+     SECTION 1 - oadrRegisterReport
+     Sent once at startup to register this VEN with the VTN.
+     The VTN responds with venID and registrationID.
+     ================================================================================== -->
+<oadrRegisterReport>
+  <ei:vendID>{{VEN_ID}}</ei:venID>
+  <oadrReport>
+    <ei:reportSpecifierID>report-spec-001</ei:reportSpecifierID>
+    <ei:reportName>TELEMETRY_USAGE</ei:reportName>
+    <ei:reportDescription>Load shed compliance reporting</ei:reportDescription>
+  </oadrReport>
+</oadrRegisterReport>
+
+<!-- ==================================================================================
+     SECTION 2 - oadrPoll
+     Sent every poll interval to ask VTN for pending events.
+     VTN responds with oadrDistributeEvent if an event is pending,
+     or oadrResponse if nothing is pending.
+     ================================================================================== -->
+<oadrPoll>
+  <ei:venID>{{VEN_ID}}<ei:venID>
+</oadrPoll>
+
+<!-- ==================================================================================
+     SECTION 3 - oadrCreatedEvent
+     Sent to acknowledge a received event (the echo).
+     optIn = we will comply, optOut = we cannot comply.
+     ================================================================================== -->
+<oadrCreatedEvent>
+  <ei:eiCreatedEvent>
+    <ei:venID>{{VEN_ID}}</ei:venID>
+    <ei:eventResponses>
+      <ei:eventResponse>
+        <ei:eventID>{{EVENT_ID}}</ei:eventID>
+        <ei:optType>{{OPT_TYPE}}</ei:optType>
+      </ei:eventResponse>
+    </ei:eventResponses>
+  </ei:eiCreatedEvent>
+</oadrCreatedEvent>
+
+<!-- ==================================================================================
+     SECTION 4 - oadrUpdateReport
+     Sent after acting on an event to report actual load shed.
+     {{Report_VALUE is the kW value actually shed.
+     ================================================================================== -->
+<oadrUpdateReport>
+  <ei:venID>{{VEN_ID}}</ei:venID>
+  <ei:reportPayload>
+    <ei:rID>{{REPORT_ID}}</ei:rID>
+    <ei:payloadFloat>
+      <ei:value>{{REPORT_VALUE}}</ei:value>
+    </ei:payloadFloat>
+  </ei:reportPayload>
+</oadrUpdateReport>
