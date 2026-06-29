@@ -16,57 +16,100 @@
 -->
 
 <!-- ==================================================================================
-     SECTION 1 - oadrRegisterReport
-     Sent once at startup to register this VEN with the VTN.
+     SECTION 1 - oadrCreatePartyRegistration
+     Sent once at startup to introduce VEN to VTN 
      The VTN responds with venID and registrationID.
      ================================================================================== -->
-<oadrRegisterReport>
-  <ei:vendID>{{VEN_ID}}</ei:venID>
-  <oadrReport>
-    <ei:reportSpecifierID>report-spec-001</ei:reportSpecifierID>
-    <ei:reportName>TELEMETRY_USAGE</ei:reportName>
-    <ei:reportDescription>Load shed compliance reporting</ei:reportDescription>
-  </oadrReport>
-</oadrRegisterReport>
+  <oadr:oadrCreatePartyRegistration xmlns:ei="http://docs.oasis-open.org/ns/energyinterop/201110" ei:schemaVersion="2.0b">
+  <ei:venID>{{VEN_ID}}</ei:venID>
+  <oadr:oadrProfileName>2.0b</oadr:oadrProfileName>
+  <oadr:oadrTransportName>simpleHttp</oadr:oadrTransportName>
+  <oadr:oadrTransportAddress>http://10.0.0.101</oadr:oadrTransportAddress>
+  <oadr:oadrReportOnly>false</oadr:oadrReportOnly>
+  <oadr:oadrXmlSignature>false</oadr:oadrXmlSignature>
+  <oadr:oadrVenName>{{VEN_ID}}</oadr:oadrVenName>
+</oadr:oadrCreatePartyRegistration>
 
 <!-- ==================================================================================
-     SECTION 2 - oadrPoll
+     SECTION 2 - oadrRegisterReport
+     Sent after party registration to register reporting capabilities.
+     ================================================================================== -->
+<oadr:oadrRegisterReport xmlns:ei="http://docs.oasis-open.org/ns/energyinterop/201110" ei:schemaVersion="2.0b">
+  <ei:venID>{{VEN_ID}}</ei:venID>
+  <oadr:oadrReport>
+    <ei:reportSpecifierID>report-spec-001</ei:reportSpecifierID>
+    <ei:reportName>TELEMETRY_USAGE</ei:reportName>
+  </oadr:oadrReport>
+</oadr:oadrRegisterReport>
+
+<!-- ==================================================================================
+     SECTION 3 - oadrPoll
      Sent every poll interval to ask VTN for pending events.
      VTN responds with oadrDistributeEvent if an event is pending,
      or oadrResponse if nothing is pending.
      ================================================================================== -->
-<oadrPoll>
-  <ei:venID>{{VEN_ID}}<ei:venID>
-</oadrPoll>
+<oadr:oadrPoll xmlns:ei="http://docs.oasis-open.org/ns/energyinterop/201110" ei:schemaVersion="2.0b">
+  <ei:venID>{{VEN_ID}}</ei:venID>
+</oadr:oadrPoll>
 
 <!-- ==================================================================================
-     SECTION 3 - oadrCreatedEvent
+     SECTION 4 - oadrCreatedEvent
      Sent to acknowledge a received event (the echo).
      optIn = we will comply, optOut = we cannot comply.
      ================================================================================== -->
-<oadrCreatedEvent>
+<oadr:oadrCreatedEvent xmlns:ei="http://docs.oasis-open.org/ns/energyinterop/201110" ei:schemaVersion="2.0b">
   <ei:eiCreatedEvent>
+    <ei:eiResponse>
+      <ei:responseCode>200</ei:responseCode>
+      <ei:responseDescription>OK</ei:responseDescription>
+      <ei:requestID>{{REQUEST_ID}}</ei:requestID>
+    </ei:eiResponse>
     <ei:venID>{{VEN_ID}}</ei:venID>
     <ei:eventResponses>
       <ei:eventResponse>
-        <ei:eventID>{{EVENT_ID}}</ei:eventID>
+        <ei:responseCode>200</ei:responseCode>
+        <ei:responseDescription>OK</ei:responseDescription>
+        <ei:requestID>{{REQUEST_ID}}</ei:requestID>
+        <ei:qualifiedEventID>
+          <ei:eventID>{{EVENT_ID}}</ei:eventID>
+          <ei:modificationNumber>0</ei:modificationNumber>
+        </ei:qualifiedEventID>
         <ei:optType>{{OPT_TYPE}}</ei:optType>
       </ei:eventResponse>
     </ei:eventResponses>
   </ei:eiCreatedEvent>
-</oadrCreatedEvent>
+</oadr:oadrCreatedEvent>
 
 <!-- ==================================================================================
-     SECTION 4 - oadrUpdateReport
+     SECTION 5 - oadrUpdateReport
      Sent after acting on an event to report actual load shed.
-     {{Report_VALUE is the kW value actually shed.
+     {{REPORT_VALUE}} is the kW value actually shed.
      ================================================================================== -->
-<oadrUpdateReport>
+<oadr:oadrUpdateReport xmlns:ei="http://docs.oasis-open.org/ns/energyinterop/201110" ei:schemaVersion="2.0b">
+  <pyld:requestID xmlns:pyld="http://docs.oasis-open.org/ns/energyinterop/201110/payloads">{{REQUEST_ID}}</pyld:requestID>
+  <oadr:oadrReport xmlns:xcal="urn:ietf:params:xml:ns:icalendar-2.0">
+    <ei:eiReportID>{{REPORT_ID}}</ei:eiReportID>
+    <oadr:oadrReportDescription xmlns:emix="http://docs.oasis-open.org/ns/emix/2011/06">
+      <ei:rID>rid-001</ei:rID>
+      <ei:reportSubject>
+        <ei:resourceID>resource-001</ei:resourceID>
+      </ei:reportSubject>
+      <ei:reportDataSource>
+        <ei:resourceID>resource-001</ei:resourceID>
+      </ei:reportDataSource>
+      <ei:reportType>reading</ei:reportType>
+      <ei:readingType>Direct Read</ei:readingType>
+      <emix:marketContext>http://MarketContext1</emix:marketContext>
+      <oadr:oadrSamplingRate>
+        <oadr:oadrMinPeriod>PT10S</oadr:oadrMinPeriod>
+        <oadr:oadrMaxPeriod>PT60S</oadr:oadrMaxPeriod>
+        <oadr:oadrOnChange>false</oadr:oadrOnChange>
+      </oadr:oadrSamplingRate>
+    </oadr:oadrReportDescription>
+    <ei:reportRequestID>{{REPORT_ID}}</ei:reportRequestID>
+    <ei:reportSpecifierID>report-spec-001</ei:reportSpecifierID>
+    <ei:reportName>TELEMETRY_USAGE</ei:reportName>
+    <ei:createdDateTime>2026-01-01T00:00:00Z</ei:createdDateTime>
+  </oadr:oadrReport>
   <ei:venID>{{VEN_ID}}</ei:venID>
-  <ei:reportPayload>
-    <ei:rID>{{REPORT_ID}}</ei:rID>
-    <ei:payloadFloat>
-      <ei:value>{{REPORT_VALUE}}</ei:value>
-    </ei:payloadFloat>
-  </ei:reportPayload>
-</oadrUpdateReport>
+</oadr:oadrUpdateReport>
