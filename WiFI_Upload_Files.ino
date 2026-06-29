@@ -35,23 +35,35 @@
 //
 // ============================================================
 
-#include <WiFi.h
+#include <WiFi.h>
 #include <WiFiServer.h>
 #include <BlockDevice.h>
 #include <LittleFileSystem.h>
+#include <MBRBlockDevice.h>
+
+using namespace mbed;
 
 // --Configuration Section --------------------
 
-// --Network config ---------------------------
-const char* WIFI_SSID = "Entwise";
-const char* WIFI_PASSWORD = "TolkienTreeTest2"
-IPAddress   STATIC_IP   (172, 16, 0, 2);
-IPAddress   GATEWAY     (172, 16, 0, 1);
-IPAdress    SUBNET      (255, 255, 255, 0);
-const int   HTTP_PORT   = 8888;
+// MAC address
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
+
+// WiFi Credentials
+const char* WIFI_SSID     = "Trumbull";
+const char* WIFI_PASSWORD = "xcelsior97";
+
+// Static IP configuration
+IPAddress localIP     (10, 0, 0, 101);
+IPAddress gateway     (10, 0, 0, 1);
+IPAddress subnet      (255, 255, 255, 0);
+IPAddress dns         (8, 8, 8, 8);
+
+const int HTTP_PORT = 8888;
 
 // --Filesystem-------------------------------
 BlockDevice*      bd = BlockDevice::get_default_instance();
+MBRBlockDevice    sys_bd(bd, 1);    // partition 1 - system/Wifi
+MBRBlockDevice    usr_bd(bd, 2);    // partition 2 - user data
 LittleFileSystem  fs("fs");
 
 WiFiServer  server(HTTP_PORT);
@@ -65,13 +77,21 @@ void setup() {
   Serial.println("Opta File Upload Utility");
   Serial.println("========================");
 
+  // Start File reading
   mountFilesystem();
+
+  // WiFi
+  
+  WiFi.config(localIP, gateway, subnet, dns);
   connectWiFi();
 
   server.begin();
   Serial.println("HTTP server started on port " +
                  String(HTTP_PORT));
   Serial.println();
+
+  // Delete old version of the file if present
+  deleteFile("/fs/openadr_template.xml");
 }
 
 // --Main Program Loop-------------------------
@@ -103,7 +123,7 @@ void loop() {
   }
   // Route: Post / - write file
   else if (request.startsWith("POST")) {
-    handlUpload(client, request);
+    handleUpload(client, request);
   }
   else {
     sendResponse(client, 405, "Method not allowed");
@@ -133,7 +153,7 @@ void handleUpload(WiFiClient& client, const String& request) {
     sendResponse(client, 400, "Malformed request - no body.");
     return;
   }
-  String body = request.substring(bodyStart + 4);
+  String body = request.substring(bodystart + 4);
 
   if (body.length() == 0) {
     sendResponse(client, 400, "Empty file body.");
@@ -150,7 +170,7 @@ void handleUpload(WiFiClient& client, const String& request) {
     sendResponse(client, 500, "Could not open file for writing.");
     return;
   }
-  fprintf(f, %s, body.c_str());
+  fprintf(f, "%s", body.c_str());
   fclose(f);
 
   Serial.println("OK (" + String(body.length()) + " bytes)");
@@ -169,7 +189,7 @@ void handleUpload(WiFiClient& client, const String& request) {
                "Verified: " + String(verifySize) + " bytes on flash\n";
 
   Serial.println(msg);
-  sendResponse(client, 200, msgg);
+  sendResponse(client, 200, msg);
 
   // List all files so operator can confirm
   listFiles();
@@ -185,7 +205,7 @@ void handleRead(WiFiClient& client, const String& request) {
 
   // Remove leading slash if present
   if (filename.startsWith("/")) {
-    filename = silename.substring(1);
+    filename = filename.substring(1);
   }
 
   String path = "/fs/" + filename;
@@ -229,7 +249,7 @@ void sendResponse(WiFiClient& client, int code,
 }
 
 // Extract a header value from raw HTTP request
-String extractHeader(const String& reqeust,
+String extractHeader(const String& request,
                      const String& headerName) {
   String search = headerName + ": ";
   int start = request.indexOf(search);
@@ -259,11 +279,45 @@ void listFiles() {
 
 // Filesystem mount
 void mountFilesystem() {
-  Serial.print("Mountin filesystem... ");
-  int err = fs.mount(bd);
+  Serial.print("Initializing block device... ");
+  int err = bd->init();
   if (err) {
-    Serial.println("not found. Formatting...");
-    fs.reformat(bd);
+    Serial.println("FAILED to initialize block device.");
+    Serial.println("Halting.");
+    while(1);
+  }
+  Serial.println("OK");
+
+  // Create partition table if it doesn't exist
+  // Partition 1: system/WiFi firmware - first 1MB
+  // Partition 2: user data - remaining space
+  Serial.print("Setting up partition table... ");
+  err = MBRBlockDevice::partition(bd, 1, 0x83, 0, 1024 * 1024);
+  if (err) {
+    Serial.println("Partition 1 setup failed - may already exist, continuing...");
+  }
+  err = MBRBlockDevice::partition(bd, 2, 0x83, 1024 * 1024);
+  if (err) {
+    Serial.println("Partition 2 setup failed - may already exist, continuing...");
+  }
+  Serial.println("OK");
+
+  Serial.print("Mounting filesystem... ");
+
+  // Only mount partition 2 - never touch partition 1
+  // Partition 1 contains WiFi firmware and must not be reformated
+  err = fs.mount(&usr_bd);
+  if (err) {
+    Serial.println("not found. Formatting user partition only...");
+    // Only reformat the user data partition, not the whole device
+    err = fs.reformat(&usr_bd);
+    if (err) {
+      Serial.println("FAILED to format user partition.");
+      Serial.println("Halting.");
+      while(1);
+    } else {
+      Serial.println("OK");
+    }
   } else {
     Serial.println("OK");
   }
@@ -272,13 +326,73 @@ void mountFilesystem() {
 // Wifi Connect
 void connectWiFi() {
   Serial.print("Connecting to WiFi");
-  WiFi.config(STATIC_IP, GATEWAY, SUBNET);
-  WiFi.begin(WIFI_SSID), WIFI_PASS);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  int attempts = 0;
+  const int MAX_ATTEMPTS = 10;
+
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
+    attempts++;
+
+    if (attempts >= MAX_ATTEMPTS) {
+      Serial.println();
+      Serial.print("WiFi connection failed after ");
+      Serial.print(MAX_ATTEMPTS / 2);
+      Serial.println(" seconds. Status code: ");
+      switch (WiFi.status()) {
+        case WL_DISCONNECTED:
+          Serial.println("  WL_DISCONNECTED — check SSID and password");
+          break;
+        case WL_CONNECTION_LOST:
+          Serial.println("  WL_CONNECTION_LOST — signal may be too weak");
+          break;
+        case WL_CONNECT_FAILED:
+          Serial.println("  WL_CONNECT_FAILED — authentication failed, check password");
+          break;
+        case WL_NO_SSID_AVAIL:
+          Serial.println("  WL_NO_SSID_AVAIL — network not found, check SSID");
+          break;
+        case WL_IDLE_STATUS:
+          Serial.println("  WL_IDLE_STATUS — WiFi module not responding");
+          break;
+        default:
+          Serial.print("  Unknown status code: ");
+          Serial.println(WiFi.status());
+          break;
+      }
+      Serial.println("Halting. Reset the Opta to retry.");
+      while (1);
+    }
   }
+
   Serial.println();
-  Serial.print("Connected. IP: ");
-  Serial.println(WiFi.localIP());
+  Serial.print("WiFi connected to: ");
+  Serial.println(WIFI_SSID);
+
+  // Confirm the IP was assigned correctly
+  if (WiFi.localIP() == localIP) {
+    Serial.print("Static IP configured successfully. IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.print("Warning: IP mismatch. Got: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("Expected: ");
+    Serial.println(localIP);
+    Serial.println("Continuing with assigned IP — update localIP in sketch if needed.");
+  }
+}
+
+// Delete old versions of the file
+
+void deleteFile(const char* path) {
+  Serial.print("Deleting: ");
+  Serial.println(path);
+  int result = remove(path);
+  if (result == 0) {
+    Serial.println("Deleted successfully.");
+  } else {
+    Serial.println("Delete failed — file may not exist.");
+  }
 }
