@@ -58,13 +58,7 @@ const int   BROKER_PORT = 1883;
 MqttClient  mqttClient(wifiClient);
 // MQTT Topics
 const char* TOPIC_STATUS        = "opta/status";
-
-// NTP Configuration
-const char*  NTP_SERVER       = "pool.ntp.org";
-const int    NTP_PORT         = 123;
-const int    NTP_PACKET_SIZE  = 48;
-const uint32_t NTP_TIMEOUT_MS = 3000;   // wait per attempt for a reply
-const int    NTP_MAX_ATTEMPTS = 5;
+const char* TOPIC_APP_DISPATCH  = "opta/commands/app/dispatch";
 
 WiFiUDP ntpUdp;
 byte    ntpPacketBuffer[NTP_PACKET_SIZE];
@@ -73,22 +67,27 @@ byte    ntpPacketBuffer[NTP_PACKET_SIZE];
 bool dispatchGen = false;
 bool prevDispatch = false;
 
-// OpenADR JSON Configuration
+// OpenADR Asset Configuration
+const char* regProgramApp = "44"; // the asset's registered programID
+
+// OpenADR JSON Templates Configuration
 // OpenADR Command names:
 struct OpenAdr3EventFields {
+  const char* eventID;       // NEW -- event-level object identifier, doc[] scope
   const char* eventName;
   const char* programID;
   const char* period;
   const char* periodStart;
   const char* periodDur;
   const char* interval;
-  const char* intervalId;
+  const char* intervalId;    // interval[] scope -- same key name as eventID, different parent
   const char* payload;
   const char* payloadType;
   const char* payloadValue;
 };
 
 const OpenAdr3EventFields APP_COMMAND = {
+  .eventID      = "id",
   .eventName    = "eventName",
   .programID    = "programID",
   .period       = "intervalPeriod",
@@ -101,23 +100,48 @@ const OpenAdr3EventFields APP_COMMAND = {
   .payloadValue = "values"
 };
 
-// Command Schedule Configuration
-#define MAX_INTERVALS 96   // 24h at 15-min minimum resolution
-#define MIN_DURATION_SECONDS  (15 * 60) // Limits duration to no less than 15 minutes
-#define MAX_DURATION_SECONDS  (24 * 3600) // Limits duration to no more than 24 hours
-#define MAX_START_HORIZON_SECONDS (24 * 3600) // Limits intervals to start no more than 24 hours from now
-#define MAX_EVENTNAME_LEN 32
+// Sentinel values per OpenADR 3.0 §7.3 / §7.9
+// Used to determine if a command is for an instant command or to clear a command
+static const char* SENTINEL_START         = "0001-01-01T00:00:00";
+static const char* SENTINEL_START_ALT     = "0001-01-01";
+static const char* SENTINEL_DURATION_INF  = "P9999Y";
+static const char* SENTINEL_DURATION_ZERO = "PT0S";
 
-struct DispatchInterval {
-  char    eventName[MAX_EVENTNAME_LEN];     // Name of event that scheduled this interval
-  time_t  startTime;                        // epoch seconds, converted from ISO-8601
-  time_t  endTime;                          // startTime + duration
-  uint8_t dispatchValue;                    // 0 = grid, 1 = generator
-  uint8_t priority;                         // 1-99, default 1 for now
+// Parsed command template
+
+enum CommandClassification { CMD_ASSERT, CMD_RELEASE, CMD_UNSUPPORTED_SCHEDULE };
+
+struct ParsedCommand {
+  char                  eventId[MAX_EVENTID_LEN];
+  char                  eventName[MAX_EVENTNAME_LEN];
+  uint8_t               dispatchValue;   // only meaningful when classification == CMD_ASSERT
+  CommandClassification classification;
 };
 
-DispatchInterval schedule[MAX_INTERVALS];
-int scheduleHead = 0;  // physical index of the current logical front (interval 0)
+// Command Arbitration Configuration
+// Lower number = higher precedence.
+#define PRIORITY_APP      1
+#define PRIORITY_COOP     50
+#define PRIORITY_DEFAULT  99
+
+#define MAX_EVENTID_LEN   32
+#define MAX_EVENTNAME_LEN 32
+
+enum CommandSource { SOURCE_APP = 0, SOURCE_COOP = 1, SOURCE_SCHEDULE = 2, NUM_SOURCES = 3 };
+
+struct CommandSlot {
+  char          eventId[MAX_EVENTID_LEN];         // currently active event, if any
+  char          eventName[MAX_EVENTNAME_LEN];
+  uint8_t       dispatchValue;
+  uint8_t       priority;
+  bool          active;
+  unsigned long receivedMillis;
+  char          lastSeenEventId[MAX_EVENTID_LEN]; // most recent event ID from this source,
+                                                    // regardless of whether it was actionable --
+                                                    // traceability only, never read by arbitration
+};
+
+CommandSlot sources[NUM_SOURCES];
 
 // -- Setup Section ----------------------------
 // Code here runs once
@@ -151,6 +175,14 @@ void setup() {
 
   // Start MQTT
   connectMQTT();
+  mqttClient.subscribe(TOPIC_APP_DISPATCH, 1);
+  mqttClient.onMessage(onMqttMessage);
+  // TODO: subscribe() + onMessage() above must be repeated inside the
+  // reconnection handler once built -- MQTT subscriptions do not survive
+  // a broker disconnect/reconnect automatically.
+
+  // Initialize control source
+  initializeDefaultSource();
 
   // Initialize relay output
   pinMode(D0, OUTPUT);
@@ -158,8 +190,6 @@ void setup() {
   digitalWrite(D0, LOW);
   digitalWrite(LED_D0, LOW);
 
-  // Initialize the schedule
-  initializeSchedule()
 }
 
 
@@ -169,15 +199,11 @@ void setup() {
 void loop() {
   // put your main code here, to run repeatedly:
 
-  // Update the schedule
-  maintainScheduleWindow()
-
-  // Evaluate trigger commands and dispatch if called for
-  // Check the schedule
-  evaluateScheduleDispatch()
+  // Check for mqtt messages
+  mqttClient.poll();
 
   // Trigger the relay if called for
-  updateRelayOutput()
+  updateRelayOutput();
 }
 
 // -- WiFi and Ethernet Functions -------------
@@ -317,75 +343,6 @@ void connectEthernet() {
     Serial.println(localIP_eth);
     Serial.println("Continuing with assigned IP — update localIP in sketch if needed.");
   }
-}
-
-// -- Time synchronization --------------------
-
-// Builds and sends a minimal NTP client request packet.
-void sendNtpPacket() {
-  memset(ntpPacketBuffer, 0, NTP_PACKET_SIZE);
-  ntpPacketBuffer[0] = 0b11100011;   // LI=3 (unknown), VN=4, Mode=3 (client)
-  ntpPacketBuffer[1] = 0;            // Stratum, unspecified
-  ntpPacketBuffer[2] = 6;            // Polling interval
-  ntpPacketBuffer[3] = 0xEC;         // Peer clock precision
-  // Bytes 12-23 (reference/origin/receive timestamps) left as zero
-
-  ntpUdp.beginPacket(NTP_SERVER, NTP_PORT);
-  ntpUdp.write(ntpPacketBuffer, NTP_PACKET_SIZE);
-  ntpUdp.endPacket();
-}
-
-// Attempts to sync system time via NTP. Returns true on success.
-// Requires WiFi to already be connected -- does not attempt that itself.
-bool syncTimeViaNTP() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[NTP] WiFi not connected, cannot sync time");
-    return false;
-  }
-
-  ntpUdp.begin(2390);   // arbitrary local port for the UDP socket
-
-  for (int attempt = 1; attempt <= NTP_MAX_ATTEMPTS; attempt++) {
-    Serial.print("[NTP] Requesting time, attempt ");
-    Serial.print(attempt);
-    Serial.print("/");
-    Serial.println(NTP_MAX_ATTEMPTS);
-
-    sendNtpPacket();
-
-    unsigned long waitStart = millis();
-    while (millis() - waitStart < NTP_TIMEOUT_MS) {
-      if (ntpUdp.parsePacket() >= NTP_PACKET_SIZE) {
-        ntpUdp.read(ntpPacketBuffer, NTP_PACKET_SIZE);
-
-        // Seconds since 1900 live in bytes 40-43, big-endian.
-        uint32_t secsSince1900 =
-          ((uint32_t)ntpPacketBuffer[40] << 24) |
-          ((uint32_t)ntpPacketBuffer[41] << 16) |
-          ((uint32_t)ntpPacketBuffer[42] << 8)  |
-          ((uint32_t)ntpPacketBuffer[43]);
-
-        if (secsSince1900 == 0) {
-          Serial.println("[NTP] Received empty/invalid response, retrying");
-          break;  // out of the inner wait loop, on to next attempt
-        }
-
-        // NTP epoch (1900) to Unix epoch (1970) offset
-        const uint32_t SEVENTY_YEARS = 2208988800UL;
-        time_t epochTime = (time_t)(secsSince1900 - SEVENTY_YEARS);
-
-        set_time(epochTime);  // Mbed OS RTC set -- makes time(nullptr) return this going forward
-
-        Serial.print("[NTP] Synced. Epoch time: ");
-        Serial.println((unsigned long)epochTime);
-        return true;
-      }
-    }
-    Serial.println("[NTP] No response within timeout");
-  }
-
-  Serial.println("[NTP] Failed to sync after all attempts");
-  return false;
 }
 
 // -- Modbus Functions ------------------------
@@ -534,6 +491,27 @@ void connectMQTT() {
   Serial.println("Announced presence by setting presence to online");
 }
 
+// MQTT Message handler
+void onMqttMessage(int messageSize) {
+  String topic = mqttClient.messageTopic();
+
+  String payloadStr;
+  payloadStr.reserve(messageSize);
+  while (mqttClient.available()) {
+    payloadStr += (char)mqttClient.read();
+  }
+
+  Serial.print("[MQTT] Message on "); Serial.print(topic);
+  Serial.print(" ("); Serial.print(messageSize); Serial.println(" bytes)");
+
+  if (topic == TOPIC_APP_DISPATCH) {
+    parseOpenADR3Dispatch(payloadStr.c_str(), APP_COMMAND, regProgramApp, SOURCE_APP);
+  } else {
+    Serial.print("[MQTT] No handler registered for topic: ");
+    Serial.println(topic);
+  }
+}
+
 // -- Relay Control Functions -----------------
 
 // Update the relay output based on dispatchGen command.
@@ -550,17 +528,39 @@ void updateRelayOutput() {
   prevDispatch = dispatchGen;
 }
 
+// -- Control Source Functions ----------------
+
+void initializeDefaultSource() {
+  CommandSlot &def = sources[SOURCE_SCHEDULE];
+
+  strncpy(def.eventId, "default", MAX_EVENTID_LEN - 1);
+  def.eventId[MAX_EVENTID_LEN - 1] = '\0';
+  strncpy(def.eventName, "default", MAX_EVENTNAME_LEN - 1);
+  def.eventName[MAX_EVENTNAME_LEN - 1] = '\0';
+  def.dispatchValue  = 0;
+  def.priority       = PRIORITY_DEFAULT;
+  def.active         = true;
+  def.receivedMillis = millis();
+
+  sources[SOURCE_APP]  = { "", "", 0, PRIORITY_APP,  false, 0 };
+  sources[SOURCE_COOP] = { "", "", 0, PRIORITY_COOP, false, 0 };
+
+  Serial.println("[SCHED] Default source initialized: priority=99, value=grid, active");
+}
+
 // -- App Control Functions -------------------
 
-void parseOpenADR3Dispatch(const char* payload, const OpenAdrEventFields& fields, const char* regProgram) {
+void parseOpenADR3Dispatch(const char* payloadStr, const OpenAdr3EventFields& fields,
+                            const char* regProgram, CommandSource source) {
   JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, payload);
+  DeserializationError err = deserializeJson(doc, payloadStr);
   if (err) {
     Serial.print("[PARSE] JSON error: ");
     Serial.println(err.c_str());
     return;
   }
-  if (doc[fields.programID].isNull() || doc[fields.interval].isNull()) {
+
+  if (doc[fields.programID].isNull() || doc[fields.interval].isNull() || doc[fields.eventID].isNull()) {
     Serial.println("[PARSE] Missing required top-level field(s), rejecting event");
     return;
   }
@@ -573,282 +573,183 @@ void parseOpenADR3Dispatch(const char* payload, const OpenAdrEventFields& fields
     return;
   }
 
+  const char* eventId   = doc[fields.eventID];
   const char* eventName = doc[fields.eventName];
 
   JsonArray intervals = doc[fields.interval].as<JsonArray>();
-  for (JsonObject interval : intervals) {
-    if (interval[fields.intervalID].isNull() || interval[fields.payload].isNull()) {
-      Serial.println("[PARSE] Interval missing id or payloads, skipping this interval.");
-      continue;
-    }
+  if (intervals.size() == 0) {
+    Serial.println("[PARSE] No intervals present, rejecting event");
+    return;
+  }
 
-    const char* startStr;
-    const char* durStr;
-    bool hasOwnPeriod = interval[fields.period].is<JsonObject>();
-    if (hasOwnPeriod) {
-      startStr = interval[fields.period][fields.periodStart];
-      durStr   = interval[fields.period][fields.periodDur];
-    } else if (doc[fields.period].is<JsonObject>()) {
-      startStr = doc[fields.period][fields.periodStart];
-      durStr   = doc[fields.period][fields.periodDur];
-    } else {
-      Serial.println("[PARSE] No intervalPeriod at event or interval level, skipping interval.");
-      continue;
-    }
+  JsonObject interval0 = intervals[0];
+  if (interval0[fields.intervalId].isNull() || interval0[fields.payload].isNull()) {
+    Serial.println("[PARSE] Interval missing id or payloads, rejecting event.");
+    return;
+  }
 
-    if (startStr == nullptr) {
-      Serial.println("[PARSE] Missing start time, skipping this interval");
-      continue;
-    }
+  const char* startStr;
+  const char* durStr;
+  bool hasOwnPeriod = interval0[fields.period].is<JsonObject>();
+  if (hasOwnPeriod) {
+    startStr = interval0[fields.period][fields.periodStart];
+    durStr   = interval0[fields.period][fields.periodDur];
+  } else if (doc[fields.period].is<JsonObject>()) {
+    startStr = doc[fields.period][fields.periodStart];
+    durStr   = doc[fields.period][fields.periodDur];
+  } else {
+    Serial.println("[PARSE] No intervalPeriod at event or interval level, rejecting event.");
+    return;
+  }
 
-    // OpenADR 3.0 "do it now" sentinel (§7.3). Treated here as a signal to
-    // bypass the schedule entirely, not just "start = now" within it -- see
-    // caveat above this function about that being a design choice on our
-    // part, not a spec requirement.
-    bool isImmediate = (strcmp(startStr, "0001-01-01T00:00:00") == 0) ||
-                        (strcmp(startStr, "0001-01-01") == 0);
+  if (startStr == nullptr || durStr == nullptr) {
+    Serial.println("[PARSE] Missing start or duration, rejecting event.");
+    return;
+  }
 
-    JsonArray payloads = interval[fields.payload].as<JsonArray>();
+  bool isImmediateStart = (strcmp(startStr, SENTINEL_START) == 0) ||
+                          (strcmp(startStr, SENTINEL_START_ALT) == 0);
+  bool isIndefiniteDur  = (strcmp(durStr, SENTINEL_DURATION_INF) == 0);
+  bool isZeroDur        = (strcmp(durStr, SENTINEL_DURATION_ZERO) == 0);
+
+  ParsedCommand cmd = {};
+  strncpy(cmd.eventId, eventId, MAX_EVENTID_LEN - 1);
+  cmd.eventId[MAX_EVENTID_LEN - 1] = '\0';
+  strncpy(cmd.eventName, eventName ? eventName : "", MAX_EVENTNAME_LEN - 1);
+  cmd.eventName[MAX_EVENTNAME_LEN - 1] = '\0';
+
+  if (isImmediateStart && isIndefiniteDur) {
+    JsonArray payloads = interval0[fields.payload].as<JsonArray>();
     if (payloads.size() == 0) {
-      Serial.println("[PARSE] No payloads in interval, skipping this interval");
-      continue;
+      Serial.println("[PARSE] No payloads in interval, rejecting event");
+      return;
     }
     JsonVariant rawValue = payloads[0][fields.payloadValue][0];
     if (rawValue.isNull()) {
-      Serial.println("[PARSE] No dispatch value in payload, skipping");
-      continue;
+      Serial.println("[PARSE] No dispatch value in payload, rejecting event");
+      return;
     }
-    uint8_t dispatchValue = rawValue.as<int>();
+    int value = rawValue.as<int>();
+    if (value != 0 && value != 1) {
+      Serial.print("[PARSE] Unrecognized dispatch value: ");
+      Serial.print(value);
+      Serial.println(", rejecting event");
+      return;
+    }
+    cmd.dispatchValue  = (uint8_t)value;
+    cmd.classification = CMD_ASSERT;
 
-    if (isImmediate) {
-      handleImmediateAction(dispatchValue, eventName);
-      continue;  // does not touch the schedule at all
-    }
+  } else if (isImmediateStart && isZeroDur) {
+    cmd.dispatchValue  = 0;  // unused for release, per earlier design
+    cmd.classification = CMD_RELEASE;
 
-    time_t startEpoch;
-    if (!parseISO8601ToEpoch(startStr, startEpoch)) {
-      Serial.println("[PARSE] Unparseable start time, skipping this interval");
-      continue;
-    }
-    if (startEpoch - time(nullptr) > MAX_START_HORIZON_SECONDS) {
-      Serial.println("[PARSE] Start time more than 24h out, rejecting interval");
-      continue;
-    }
-    time_t endEpoch;
-    if (!parseISO8601DurationToEpoch(startEpoch, durStr, endEpoch)) {
-      Serial.println("[PARSE] Unparseable duration, skipping this interval");
-      continue;
-    }
-
-    uint8_t priority = 1;  // TODO: no priority field parsed yet -- hardcoded until
-                            // app vs. coop event priority conventions are defined
-    upsertScheduleEvent(startEpoch, endEpoch, dispatchValue, priority, eventName);
+  } else {
+    cmd.dispatchValue  = 0;  // unused for unsupported-schedule
+    cmd.classification = CMD_UNSUPPORTED_SCHEDULE;
+    Serial.println("[PARSE] Scheduled events are not supported by this controller yet.");
   }
+
+  handleParsedCommand(cmd, source);
+}
+
+// Update Command Slot
+// Updates the given source's stored slot based on a parsed/classified
+// command, then re-resolves overall dispatch authority from scratch.
+// Sources may be default, App, Coop, or scheduler per current design.
+void handleParsedCommand(const ParsedCommand &cmd, CommandSource source) {
+  CommandSlot &slot = sources[source];
+
+  // Traceability record, independent of whether this command is actionable.
+  strncpy(slot.lastSeenEventId, cmd.eventId, MAX_EVENTID_LEN - 1);
+  slot.lastSeenEventId[MAX_EVENTID_LEN - 1] = '\0';
+
+  switch (cmd.classification) {
+    case CMD_ASSERT: {
+      uint8_t fixedPriority = (source == SOURCE_APP) ? PRIORITY_APP
+                            : (source == SOURCE_COOP) ? PRIORITY_COOP
+                            : PRIORITY_DEFAULT;
+
+      strncpy(slot.eventId, cmd.eventId, MAX_EVENTID_LEN - 1);
+      slot.eventId[MAX_EVENTID_LEN - 1] = '\0';
+      strncpy(slot.eventName, cmd.eventName, MAX_EVENTNAME_LEN - 1);
+      slot.eventName[MAX_EVENTNAME_LEN - 1] = '\0';
+      slot.dispatchValue  = cmd.dispatchValue;
+      slot.priority       = fixedPriority;
+      slot.active         = true;
+      slot.receivedMillis = millis();
+
+      Serial.print("[COMMAND] Source "); Serial.print(source);
+      Serial.print(" asserted event '"); Serial.print(cmd.eventId);
+      Serial.print("' value="); Serial.println(cmd.dispatchValue);
+      break;
+    }
+
+    case CMD_RELEASE: {
+      if (!slot.active) {
+        Serial.print("[COMMAND] Release received for source "); Serial.print(source);
+        Serial.println(" but no command is currently active, ignoring.");
+        break;
+      }
+      if (strcmp(slot.eventId, cmd.eventId) != 0) {
+        Serial.print("[COMMAND] Release for event '"); Serial.print(cmd.eventId);
+        Serial.print("' does not match currently active event '");
+        Serial.print(slot.eventId); Serial.println("', ignoring stale release.");
+        break;
+      }
+      Serial.print("[COMMAND] Releasing event '"); Serial.print(cmd.eventId);
+      Serial.print("' from source "); Serial.println(source);
+      slot.active     = false;
+      slot.eventId[0] = '\0';
+      break;
+    }
+
+    case CMD_UNSUPPORTED_SCHEDULE: {
+      Serial.print("[COMMAND] Unsupported scheduled event '"); Serial.print(cmd.eventId);
+      Serial.print("' from source "); Serial.print(source);
+      Serial.println(" logged, not acted upon.");
+      // Deliberately does not touch slot.active/eventId/dispatchValue/priority --
+      // this source's arbitration state is untouched by a command we can't act on.
+      break;
+    }
+  }
+
+  resolveDispatchAuthority();
+}
+
+// Select active dispatch command
+// Full rescan across all sources, picking the lowest priority *number*
+// (highest precedence) among currently active sources. 
+// Ties: first match in iteration order (SOURCE_APP, SOURCE_COOP,
+// SOURCE_SCHEDULE) wins -- i.e., app beats coop beats schedule on a tie.
+void resolveDispatchAuthority() {
+  int winner = -1;
+  uint8_t bestPriority = 255;
+
+  for (int i = 0; i < NUM_SOURCES; i++) {
+    if (sources[i].active && sources[i].priority < bestPriority) {
+      bestPriority = sources[i].priority;
+      winner = i;
+    }
+  }
+
+  // winner should never be -1 given SOURCE_SCHEDULE's permanent active
+  // state -- treat as a bug, not a runtime condition, if this ever fires.
+  if (winner == -1) {
+    Serial.println("[COMMAND] ERROR: no active source found during arbitration -- this should be unreachable.");
+    dispatchGen = false;
+    updateRelayOutput();
+    return;
+  }
+
+  dispatchGen = (sources[winner].dispatchValue == 1);
+
+  Serial.print("[COMMAND] Arbitration winner: source "); Serial.print(winner);
+  Serial.print(" (priority "); Serial.print(sources[winner].priority);
+  Serial.print(") -> dispatchGen="); Serial.println(dispatchGen ? "true" : "false");
+
+  updateRelayOutput();
 }
 
 // -- App Telemetry Functions -----------------
 
 // -- Data Conversion Functions ---------------
-// Time conversion helper
-bool parseISO8601ToEpoch(const char* isoStr, time_t &outEpoch) {
-  if (isoStr == nulptr) return fals;
-  struct tm tmStruct = {0};
-  int matched = sscanf(isoStr, "%d-%d-%dT%d:%d:%d",
-                        &tmStruct.tm_year, &tmStruct.tm_mon, %tmStruct.tm_mday,
-                        &tmStruct.tm_hour, &tmStruct.tm_min, &tmStruct.tm_sec);
-  if (matched < 6) return false;
-  tmStruct.tm_year  -= 1900;
-  tmStruct.tm_mon   -= 1;
-  outEpoch = timegm(&tmStruct); // UTC
-  return true
-}
-
-// Duration conversion helper
-bool parseISO8601DurationToEpoch(time_t startEpoch, const char* durStr, time_t &outEpoch) {
-  if (durStr == nullptr || durStr[0] != 'P') {
-    return false;
-  }
-
-  const char* p = durStr + 1;  // skip leading 'P'
-  bool inTimePart = false;     // true once we've passed the 'T' separator
-  long totalSeconds = 0;
-  long clampedTotalSeconds = 0;
-  bool matchedAnyUnit = false;
-
-  while (*p != '\0') {
-    if (*p == 'T') {
-      inTimePart = true;
-      p++;
-      continue;
-    }
-
-    char* numEnd;
-    long value = strtol(p, &numEnd, 10);
-    if (numEnd == p || *numEnd == '\0') {
-      // no digits consumed, or a number with no unit letter after it
-      Serial.println("[PARSE] Malformed duration string");
-      return false;
-    }
-
-    char unit = *numEnd;
-    p = numEnd + 1;
-
-    switch (unit) {
-      case 'H':
-        if (!inTimePart) { Serial.println("[PARSE] 'H' outside time part"); return false; }
-        totalSeconds += value * 3600L;
-        matchedAnyUnit = true;
-        break;
-      case 'M':
-        if (!inTimePart) {
-          // 'M' before 'T' means months in ISO-8601 -- ambiguous length
-          // (28-31 days), not convertible to a fixed second count.
-          Serial.println("[PARSE] Month durations not supported");
-          return false;
-        }
-        totalSeconds += value * 60L;
-        matchedAnyUnit = true;
-        break;
-      case 'S':
-        if (!inTimePart) { Serial.println("[PARSE] 'S' outside time part"); return false; }
-        totalSeconds += value;
-        matchedAnyUnit = true;
-        break;
-      case 'D':
-        totalSeconds += value * 86400L;
-        matchedAnyUnit = true;
-        break;
-      default:
-        // Covers 'Y' (years -- ambiguous length, same issue as months)
-        // and anything else unrecognized.
-        Serial.print("[PARSE] Unsupported duration unit: ");
-        Serial.println(unit);
-        return false;
-    }
-  }
-
-  if (!matchedAnyUnit) {
-    return false;  // e.g. bare "PT" with nothing after it
-  }
-
-  // Clamp durations between 15 minutes and 24 hours
-  if (totalSeconds > 0 && totalSeconds < MIN_DURATION_SECONDS) {
-    clampedTotalSeconds = MIN_DURATION_SECONDS;
-    Serial.println("[PARSE] Duration below 15-minute minimum, rounded up");
-  } else if (totalSeconds > MAX_DURATION_SECONDS) {
-    clampedTotalSeconds = MAX_DURATION_SECONDS;
-    Serial.println("[PARSE] Duration exceeds 24-hour maximum, truncated");
-  } else {
-    clampedTotalSeconds = totalSeconds;
-  }
-
-  outEpoch = startEpoch + (time_t)clampedTotalSeconds;
-  return true;
-}
-
-// Schedule maintenance functions
-
-// Schedule head finder.
-// The schedule head can be at a non-zero location in the array since
-// the schedule uses a ring bus. 
-DispatchInterval& getScheduleSlot(int logicalIndex) {
-  return schedule[(scheduleHead + logicalIndex) % MAX_INTERVALS];
-}
-
-// Schedule initialization helper.
-// Populates the schedule with 96 contiguous 15-minute default intervals,
-// starting from the current time. 
-void initializeSchedule() {
-  time_t nowTime = time(nullptr);
-  scheduleHead = 0;  // fresh window: logical position 0 == physical index 0
-
-  for (int i = 0; i < MAX_INTERVALS; i++) {
-    DispatchInterval &slot = getScheduleSlot(i);
-    slot.startTime     = nowTime + (i * MIN_DURATION_SECONDS);
-    slot.endTime       = slot.startTime + MIN_DURATION_SECONDS;
-    slot.dispatchValue = 0;    // grid
-    slot.priority      = 99;   // default -- lowest priority, always overridable
-    strncpy(slot.eventName, "default", MAX_EVENTNAME_LEN - 1);
-    slot.eventName[MAX_EVENTNAME_LEN - 1] = '\0';
-  }
-
-  Serial.print("[SCHED] Initialized ");
-  Serial.print(MAX_INTERVALS);
-  Serial.println(" default intervals");
-}
-
-// Schedule maintainer
-// Updates the schedule window as time passes. Drops any expired 
-// interval(s) from the front of the window and appends an equal 
-// number of fresh default intervals to the tail -- without 
-// shifting any existing data.
-void maintainScheduleWindow() {
-  time_t nowTime = time(nullptr);
-
-  while (schedule[scheduleHead].endTime <= nowTime) {
-    int tailIndex = (scheduleHead + MAX_INTERVALS - 1) % MAX_INTERVALS;
-    time_t newStart = schedule[tailIndex].endTime;
-
-    DispatchInterval &slot = schedule[scheduleHead];
-    slot.startTime     = newStart;
-    slot.endTime        = newStart + MIN_DURATION_SECONDS;
-    slot.dispatchValue = 0;     // grid
-    slot.priority      = 99;    // default
-    strncpy(slot.eventName, "default", MAX_EVENTNAME_LEN - 1);
-    slot.eventName[MAX_EVENTNAME_LEN - 1] = '\0';
-
-    scheduleHead = (scheduleHead + 1) % MAX_INTERVALS;
-  }
-}
-
-// Event scheduler
-// Applies a parsed event to the schedule.
-// Any 15-minute slot that overlaps [newStart, newEnd) is replaced with 
-// this event's value/priority/name, but only if this event's priority is 
-// equal to or numerically lower than (i.e., equal or higher precedence than) 
-// whatever currently occupies that slot. 
-// Slot boundaries themselves are never modified -- only content.
-bool upsertScheduleEvent(time_t newStart, time_t newEnd, uint8_t dispatchValue,
-                          uint8_t priority, const char* eventName) {
-  if (newStart >= newEnd) {
-    Serial.println("[SCHED] Rejected: zero/negative-length interval");
-    return false;
-  }
-
-  bool anySlotUpdated = false;
-  bool anySlotBlockedByPriority = false;
-
-  for (int i = 0; i < MAX_INTERVALS; i++) {
-    DispatchInterval &slot = getScheduleSlot(i);
-
-    bool overlaps = (slot.startTime < newEnd) && (slot.endTime > newStart);
-    if (!overlaps) continue;
-
-    if (priority <= slot.priority) {
-      slot.dispatchValue = dispatchValue;
-      slot.priority      = priority;
-      strncpy(slot.eventName, eventName, MAX_EVENTNAME_LEN - 1);
-      slot.eventName[MAX_EVENTNAME_LEN - 1] = '\0';
-      anySlotUpdated = true;
-    } else {
-      anySlotBlockedByPriority = true;
-    }
-  }
-
-  if (!anySlotUpdated && !anySlotBlockedByPriority) {
-    Serial.print("[SCHED] Event '");
-    Serial.print(eventName);
-    Serial.println("' does not overlap the current 24h window, no slots updated");
-    reportSchedulingWarning(eventName, "outside_window");
-    return false;
-  }
-
-  if (anySlotBlockedByPriority) {
-    Serial.print("[SCHED] Event '");
-    Serial.print(eventName);
-    Serial.println("' partially or fully blocked by a higher-priority existing event");
-    reportSchedulingWarning(eventName, "priority_blocked");
-  }
-
-  return anySlotUpdated;
-}
