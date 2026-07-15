@@ -69,7 +69,7 @@ struct EnrollmentConfig {
   IPAddress gateway;
   IPAddress subnet;
   IPAddress dns;
-  IPAddress server;       // meter IP address
+  IPAddress meterIP;       // meter IP address
 
   char      venId[MAX_VENID_LEN];
   char      venName[MAX_VENNAME_LEN];
@@ -89,16 +89,6 @@ bool pendingWifiReconnect  = false;
 bool pendingMqttReconnect  = false;
 
 // Network configuration
-// Wifi Credentials, MAC address, and IP configuration
-const char* WIFI_SSID = "Trumbull";
-const char* WIFI_PASSWORD = "xcelsior97";
-byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
-IPAddress localIP_wifi  (10, 0, 0, 101); // Opta IP for WiFi
-IPAddress localIP_eth   (10, 0, 0, 102); // Opta IP for Ethernet port
-IPAddress gateway       (10, 0, 0, 1);
-IPAddress subnet        (255, 255, 255, 0);
-IPAddress dns           (8, 8, 8, 8);
-IPAddress server        (10, 0, 0, 103);        // Meter IP
 
 // WiFi and Ethernet Configuration
 WiFiClient wifiClient;
@@ -112,20 +102,27 @@ ModbusTCPClient modbusTCPClient(ethClient);
 // #define USE_MODBUS_RTU
 
 // MQTT Configuration
-const char* BROKER_IP   = "10.0.0.100";
 const int   BROKER_PORT = 1883;
 MqttClient  mqttClient(wifiClient);
 // MQTT Topics
-const char* TOPIC_STATUS        = "opta/status";
-const char* TOPIC_APP_DISPATCH  = "opta/commands/app/dispatch";
-static const char* TOPIC_APP_RECONFIG = "opta/commands/app/reconfig";
+#define MAX_TOPIC_LEN 64
+
+struct TopicTable {
+  char statusTopic[MAX_TOPIC_LEN];       // publish only -- status/LWT
+  char appDispatchTopic[MAX_TOPIC_LEN];  // subscribe
+  char appReconfigTopic[MAX_TOPIC_LEN];  // subscribe
+  // future: coopDispatchTopic, coopReconfigTopic, reportTopic, etc. --
+  // added here as named fields when those channels actually exist, same
+  // pattern as everything else in this struct.
+};
+
+TopicTable topics;
 
 // Relay Configuration
 bool dispatchGen = false;
 bool prevDispatch = false;
 
 // OpenADR Asset Configuration
-const char* regProgramApp = "44"; // the asset's registered programID
 
 // OpenADR JSON Templates Configuration
 // OpenADR Command names:
@@ -228,7 +225,7 @@ void setup() {
   while (1);
   }
 
-  WiFi.config(localIP_wifi, dns, gateway, subnet);   
+  WiFi.config(registration.localIP_wifi, registration.dns, registration.gateway, registration.subnet);
   if (!connectWiFi()) {
     Serial.println("WiFi not connected at boot -- will keep retrying from loop().");
   }
@@ -245,8 +242,7 @@ void setup() {
   #endif
 
   if (connectMQTT()) {
-    mqttClient.subscribe(TOPIC_APP_DISPATCH, 1);
-    mqttClient.onMessage(onMqttMessage);
+    applyTopicSubscriptions();
   } else {
     Serial.println("MQTT not connected at boot -- will keep retrying from loop().");
   }
@@ -271,9 +267,7 @@ void loop() {
     if (connectMQTT()) {
       // Subscriptions don't survive a broker reconnect -- must be redone
       // every time a new MQTT session is established, not just at boot.
-      mqttClient.subscribe(TOPIC_APP_DISPATCH, 1);
-      mqttClient.subscribe(TOPIC_APP_RECONFIG, 1);
-      mqttClient.onMessage(onMqttMessage);
+      applyTopicSubscriptions();
     }
   }
 
@@ -305,9 +299,7 @@ void loop() {
     Serial.println("[RECONFIG] Applying new MQTT/VTN settings...");
     mqttClient.stop();  // force a clean disconnect before reconnecting with new broker/credentials
     if (connectMQTT()) {
-      mqttClient.subscribe(TOPIC_APP_DISPATCH, 1);
-      mqttClient.subscribe(TOPIC_APP_RECONFIG, 1);
-      mqttClient.onMessage(onMqttMessage);
+      applyTopicSubscriptions();
     }
   }
 
@@ -484,7 +476,17 @@ bool loadConfigFromFlash(EnrollmentConfig &cfg) {
   ok &= copyJsonIPField(doc, "gateway",      cfg.gateway,      true);
   ok &= copyJsonIPField(doc, "subnet",       cfg.subnet,       true);
   ok &= copyJsonIPField(doc, "dns",          cfg.dns,          true);
-  ok &= copyJsonIPField(doc, "server",       cfg.server,       true);
+  ok &= copyJsonIPField(doc, "meterIP",      cfg.meterIP,      true);
+
+  JsonVariantConst topicsObj = doc["topics"];
+  if (topicsObj.isNull()) {
+    Serial.println("[CONFIG] Missing 'topics' section, rejecting config.");
+    ok = false;
+  } else {
+    ok &= copyJsonStringField(topicsObj, "statusTopic",      topics.statusTopic,      MAX_TOPIC_LEN, true);
+    ok &= copyJsonStringField(topicsObj, "appDispatchTopic", topics.appDispatchTopic, MAX_TOPIC_LEN, true);
+    ok &= copyJsonStringField(topicsObj, "appReconfigTopic", topics.appReconfigTopic, MAX_TOPIC_LEN, true);
+  }
 
   if (!ok) {
     Serial.println("[CONFIG] One or more fields failed validation, rejecting config.");
@@ -501,7 +503,7 @@ bool loadConfigFromFlash(EnrollmentConfig &cfg) {
 // config file once the full file has been confirmed. This avoids having
 // an invalid truncated file if the write fails part of the way through.
 bool saveConfigToFlash(const EnrollmentConfig &cfg) {
-  /JsonDocument doc;
+  JsonDocument doc;
 
   doc["vtnURL"]       = cfg.vtnURL;
   doc["clientId"]     = cfg.clientId;
@@ -518,12 +520,17 @@ bool saveConfigToFlash(const EnrollmentConfig &cfg) {
   doc["gateway"]      = cfg.gateway.toString();
   doc["subnet"]       = cfg.subnet.toString();
   doc["dns"]          = cfg.dns.toString();
-  doc["server"]       = cfg.server.toString();
+  doc["meterIP"]      = cfg.meterIP.toString();
 
   JsonArray macArr = doc["mac"].to<JsonArray>();
   for (int i = 0; i < 6; i++) {
     macArr.add(cfg.mac[i]);
   }
+
+  JsonObject topicsObj = doc["topics"].to<JsonObject>();
+  topicsObj["statusTopic"]      = topics.statusTopic;
+  topicsObj["appDispatchTopic"] = topics.appDispatchTopic;
+  topicsObj["appReconfigTopic"] = topics.appReconfigTopic;
 
   FILE* f = fopen(CONFIG_TEMP_PATH, "w");
   if (f == nullptr) {
@@ -655,7 +662,7 @@ bool connectWiFi() {
   WiFi.end();
   delay(1000);
   Serial.print("Connecting to WiFi");
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(registration.wifiSSID, registration.wifiPassword);
 
   int attempts = 0;
   const int MAX_ATTEMPTS = 10;
@@ -698,16 +705,16 @@ bool connectWiFi() {
 
   Serial.println();
   Serial.print("WiFi connected to: ");
-  Serial.println(WIFI_SSID);
+  Serial.println(registration.wifiSSID);
 
-  if (WiFi.localIP() == localIP_wifi) {
+  if (WiFi.localIP() == registration.localIP_wifi) {
     Serial.print("Static IP configured successfully. IP: ");
     Serial.println(WiFi.localIP());
   } else {
     Serial.print("Warning: IP mismatch. Got: ");
     Serial.println(WiFi.localIP());
     Serial.print("Expected: ");
-    Serial.println(localIP_wifi);
+    Serial.println(registration.localIP_wifi);
     Serial.println("Continuing with assigned IP — update localIP in sketch if needed.");
   }
   return true;
@@ -718,7 +725,7 @@ bool connectWiFi() {
 // Provides troubleshooting for the connection if it fails
 bool connectEthernet() {
   Serial.print("Connecting to Ethernet");
-  Ethernet.begin(mac, localIP_eth, dns, gateway, subnet);
+  Ethernet.begin(registration.mac, registration.localIP_eth, registration.dns, registration.gateway, registration.subnet);
 
   int attempts = 0;
   const int MAX_ATTEMPTS = 10;
@@ -729,7 +736,6 @@ bool connectEthernet() {
       return false;
 
     case EthernetMbed: {
-      bool linkUp = false;
       while (Ethernet.linkStatus() == LinkOFF) {
         delay(500);
         Serial.print(".");
@@ -755,7 +761,6 @@ bool connectEthernet() {
           return false;
         }
       }
-      linkUp = true;
       break;
     }
 
@@ -768,15 +773,15 @@ bool connectEthernet() {
   Serial.println(" Link up.");
   delay(500);
 
-  if (Ethernet.localIP() == localIP_eth) {
+  if (Ethernet.localIP() == registration.localIP_eth) {
     Serial.print("Static IP configured successfully. IP: ");
     Serial.println(Ethernet.localIP());
   } else {
     Serial.print("Warning: IP mismatch. Got: ");
     Serial.println(Ethernet.localIP());
     Serial.print("Expected: ");
-    Serial.println(localIP_eth);
-    Serial.println("Continuing with assigned IP — update localIP in sketch if needed.");
+    Serial.println(registration.localIP_eth);
+    Serial.println("Continuing with assigned IP — update localIP_eth via reconfiguration if needed.");
   }
   return true;
 }
@@ -785,7 +790,7 @@ bool connectEthernet() {
 
 // TCP Setup
 void setupTCP() {
-  if (!modbusTCPClient.begin(server, MODBUS_TCP_PORT)) {
+  if (!modbusTCPClient.begin(registration.meterIP, MODBUS_TCP_PORT)) {
     Serial.print("Failed to connect to Modbus TCP server. Error: ");
     Serial.println(modbusTCPClient.lastError());
     return;
@@ -865,7 +870,7 @@ void writeHoldingRegister(int index, int value) {
 // -- MQTT Functions --------------------------
 
 bool connectMQTT() {
-  mqttClient.beginWill(TOPIC_STATUS, true, 1);
+  mqttClient.beginWill(topics.statusTopic, true, 1);
   mqttClient.print("offline");
   mqttClient.endWill();
 
@@ -873,7 +878,7 @@ bool connectMQTT() {
   int attempts = 0;
   const int MAX_ATTEMPTS = 10;
 
-  while (!mqttClient.connect(BROKER_IP, BROKER_PORT)) {
+  while (!mqttClient.connect(registration.vtnURL, BROKER_PORT)) {
     int error = mqttClient.connectError();
     Serial.println();
     Serial.print("Connection attempt ");
@@ -902,11 +907,19 @@ bool connectMQTT() {
   Serial.println();
   Serial.println("MQTT connected.");
 
-  mqttClient.beginMessage(TOPIC_STATUS, true);
+  mqttClient.beginMessage(topics.statusTopic, true);
   mqttClient.print("online");
   mqttClient.endMessage();
   Serial.println("Announced presence by setting presence to online");
   return true;
+}
+
+// MQTT Subscription function
+void applyTopicSubscriptions() {
+  mqttClient.subscribe(topics.appDispatchTopic, 1);
+  mqttClient.subscribe(topics.appReconfigTopic, 1);
+  mqttClient.onMessage(onMqttMessage);
+  Serial.println("[MQTT] Subscriptions applied.");
 }
 
 // MQTT Message handler
@@ -922,11 +935,11 @@ void onMqttMessage(int messageSize) {
   Serial.print("[MQTT] Message on "); Serial.print(topic);
   Serial.print(" ("); Serial.print(messageSize); Serial.println(" bytes)");
 
-  if (topic == TOPIC_APP_DISPATCH) {
+  if (topic == topics.appDispatchTopic) {
     parseOpenADR3Dispatch(payloadStr.c_str(), APP_COMMAND, registration.programId, SOURCE_APP);
     return;
   } 
-  if (topic == TOPIC_APP_RECONFIG) {
+  if (topic == topics.appReconfigTopic) {
     ReconfigResult r = applyReconfiguration(payloadStr.c_str(), registration);
     if (r.ok) {
       pendingWifiReconnect |= r.wifiChanged;
