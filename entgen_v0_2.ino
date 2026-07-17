@@ -43,37 +43,51 @@ LittleFileSystem  fs("fs");
 
 // Enrollment Configuration Structure
 
-#define MAX_SSID_LEN     32
-#define MAX_PASSWORD_LEN 64
-#define MAX_URL_LEN      128
-#define MAX_CLIENTID_LEN 64
-#define MAX_SECRET_LEN   64
-#define MAX_VENID_LEN    32
-#define MAX_VENNAME_LEN  32
-#define MAX_PROGRAMID_LEN 32
+#define MAX_SSID_LEN        32
+#define MAX_PASSWORD_LEN    64
+#define MAX_URL_LEN         128
+#define MAX_CLIENTID_LEN    64
+#define MAX_SECRET_LEN      64
+#define MAX_VENID_LEN       32
+#define MAX_VENNAME_LEN     32
+#define MAX_PROGRAMID_LEN   32
+#define MAX_RESOURCES       16
+#define MAX_RESOURCEID_LEN  32
+
+
 #define CONFIG_FILE_PATH "/fs/config.json"
 #define CONFIG_TEMP_PATH "/fs/config.json.tmp"
 #define CONFIG_READ_BUFFER_SIZE 1536   // generous margin above expected file size
 
+// This structure defines information in a resource.
+// This information includes the resource name, and 
+// can be expanded to include technical information
+// such as rated power in the future. 
+struct ResourceInfo {
+  char name[MAX_RESOURCEID_LEN];
+};
+
 struct EnrollmentConfig {
-  char      vtnURL[MAX_URL_LEN];
-  char      clientId[MAX_CLIENTID_LEN];
-  char      clientSecret[MAX_SECRET_LEN];
+  char          vtnURL[MAX_URL_LEN];
+  char          clientId[MAX_CLIENTID_LEN];
+  char          clientSecret[MAX_SECRET_LEN];
 
-  char      wifiSSID[MAX_SSID_LEN];
-  char      wifiPassword[MAX_PASSWORD_LEN];
+  char          wifiSSID[MAX_SSID_LEN];
+  char          wifiPassword[MAX_PASSWORD_LEN];
 
-  byte      mac[6];
-  IPAddress localIP_wifi;
-  IPAddress localIP_eth;
-  IPAddress gateway;
-  IPAddress subnet;
-  IPAddress dns;
-  IPAddress meterIP;       // meter IP address
+  byte          mac[6];
+  IPAddress     localIP_wifi;
+  IPAddress     localIP_eth;
+  IPAddress     gateway;
+  IPAddress     subnet;
+  IPAddress     dns;
+  IPAddress     meterIP;       // meter IP address
 
-  char      venId[MAX_VENID_LEN];
-  char      venName[MAX_VENNAME_LEN];
-  char      programId[MAX_PROGRAMID_LEN];
+  char          venId[MAX_VENID_LEN];
+  char          venName[MAX_VENNAME_LEN];
+  char          programId[MAX_PROGRAMID_LEN];
+  ResourceInfo  resources[MAX_RESOURCES];
+  uint8_t       resourceCount;
 };
 
 EnrollmentConfig registration;
@@ -111,6 +125,8 @@ struct TopicTable {
   char statusTopic[MAX_TOPIC_LEN];       // publish only -- status/LWT
   char appDispatchTopic[MAX_TOPIC_LEN];  // subscribe
   char appReconfigTopic[MAX_TOPIC_LEN];  // subscribe
+  char reportTopic[MAX_TOPIC_LEN];       // publish only -- covers all report types, differentiated by report content
+  char reportRequestTopic[MAX_TOPIC_LEN]; // subscribe
   // future: coopDispatchTopic, coopReconfigTopic, reportTopic, etc. --
   // added here as named fields when those channels actually exist, same
   // pattern as everything else in this struct.
@@ -125,7 +141,7 @@ bool prevDispatch = false;
 // OpenADR Asset Configuration
 
 // OpenADR JSON Templates Configuration
-// OpenADR Command names:
+// OpenADR Command Template
 struct OpenAdr3EventFields {
   const char* eventID;       // NEW -- event-level object identifier, doc[] scope
   const char* eventName;
@@ -152,6 +168,35 @@ const OpenAdr3EventFields APP_COMMAND = {
   .payload      = "payloads",
   .payloadType  = "type",
   .payloadValue = "values"
+};
+
+// OpenADR Report Template
+struct OpenADR3ReportFields {
+  const char* reportName;
+  const char* clientName;
+  const char* programID;
+  const char* eventID;
+  const char* resources;
+  const char* resourceName;
+  const char* interval;
+  const char* intervalId;
+  const char* payload;
+  const char* payloadType;
+  const char* payloadValue;
+};
+
+const OpenADR3ReportFields APP_REPORT = {
+  .reportName     = "reportName",
+  .clientName     = "clientName",
+  .programID      = "programID",
+  .eventID        = "eventID",
+  .resources      = "resources",
+  .resourceName   = "resourceName",
+  .interval       = "intervals",
+  .intervalId     = "id",
+  .payload        = "payloads",
+  .payloadType    = "type",
+  .payloadValue   = "values"
 };
 
 // Sentinel values per OpenADR 3.0 §7.3 / §7.9
@@ -196,6 +241,30 @@ struct CommandSlot {
 };
 
 CommandSlot sources[NUM_SOURCES];
+
+// Report Entry and Message Templates
+#define MAX_REPORTNAME_LEN 32
+#define MAX_CLIENTNAME_LEN 32
+#define REPORT_BUFFER_SIZE 768   // generous margin for a handful of resources  
+
+static const char* PAYLOAD_TYPE_SIMPLE = "SIMPLE";
+
+// Resource template - one entry per resource included in a report
+struct ReportResourceEntry {
+  char    resourceName[MAX_RESOURCEID_LEN];
+  bool    hasIntervalData;
+  uint8_t payloadValue; // SIMPLE value, only meaningful if interval exists
+};
+
+struct ReportMessage {
+  char                reportName[MAX_REPORTNAME_LEN];
+  char                clientName[MAX_CLIENTNAME_LEN];
+  bool                hasEventID;
+  char                eventID[MAX_EVENTID_LEN];
+  ReportResourceEntry resourceEntries[MAX_RESOURCES];
+  uint8_t             resourceCount;
+};
+
 
 // -- Setup Section ----------------------------
 // Code here runs once
@@ -483,9 +552,32 @@ bool loadConfigFromFlash(EnrollmentConfig &cfg) {
     Serial.println("[CONFIG] Missing 'topics' section, rejecting config.");
     ok = false;
   } else {
-    ok &= copyJsonStringField(topicsObj, "statusTopic",      topics.statusTopic,      MAX_TOPIC_LEN, true);
-    ok &= copyJsonStringField(topicsObj, "appDispatchTopic", topics.appDispatchTopic, MAX_TOPIC_LEN, true);
-    ok &= copyJsonStringField(topicsObj, "appReconfigTopic", topics.appReconfigTopic, MAX_TOPIC_LEN, true);
+    ok &= copyJsonStringField(topicsObj, "statusTopic",         topics.statusTopic,         MAX_TOPIC_LEN, true);
+    ok &= copyJsonStringField(topicsObj, "appDispatchTopic",    topics.appDispatchTopic,    MAX_TOPIC_LEN, true);
+    ok &= copyJsonStringField(topicsObj, "appReconfigTopic",    topics.appReconfigTopic,    MAX_TOPIC_LEN, true);
+    ok &= copyJsonStringField(topicsObj, "reportTopic",         topics.reportTopic,         MAX_TOPIC_LEN, true);
+    ok &= copyJsonStringField(topicsObj, "reportRequestTopic",  topics.reportRequestTopic,  MAX_TOPIC_LEN, true);
+  }
+
+  // Resources: a required, possibly-empty JSON array. 
+  JsonVariantConst resourcesArr = doc["resources"];
+  if (!resourcesArr.is<JsonArrayConst>()) {
+    Serial.println("[CONFIG] Missing or malformed 'resources' array, rejecting config.");
+    ok = false;
+  } else {
+    uint8_t count = 0;
+    for (JsonVariantConst entry : resourcesArr.as<JsonArrayConst>()) {
+      if (count >= MAX_RESOURCES) {
+        Serial.println("[CONFIG] WARNING: more resources in file than MAX_RESOURCES, truncating.");
+        break;
+      }
+      if (!copyJsonStringField(entry, "name", cfg.resources[count].name, MAX_RESOURCEID_LEN, true)) {
+        ok = false;
+        break;
+      }
+      count++;
+    }
+    cfg.resourceCount = count;
   }
 
   if (!ok) {
@@ -528,9 +620,17 @@ bool saveConfigToFlash(const EnrollmentConfig &cfg) {
   }
 
   JsonObject topicsObj = doc["topics"].to<JsonObject>();
-  topicsObj["statusTopic"]      = topics.statusTopic;
-  topicsObj["appDispatchTopic"] = topics.appDispatchTopic;
-  topicsObj["appReconfigTopic"] = topics.appReconfigTopic;
+  topicsObj["statusTopic"]      =   topics.statusTopic;
+  topicsObj["appDispatchTopic"] =   topics.appDispatchTopic;
+  topicsObj["appReconfigTopic"] =   topics.appReconfigTopic;
+  topicsObj["reportTopic"] =        topics.reportTopic;
+  topicsObj["reportRequestTopic"] = topics.reportRequestTopic;
+
+  JsonArray resourcesArr = doc["resources"].to<JsonArray>();
+  for (uint8_t i = 0; i < cfg.resourceCount; i++) {
+    JsonObject resourceObj = resourcesArr.add<JsonObject>();
+    resourceObj["name"] = cfg.resources[i].name;
+  }
 
   FILE* f = fopen(CONFIG_TEMP_PATH, "w");
   if (f == nullptr) {
@@ -918,8 +1018,13 @@ bool connectMQTT() {
 void applyTopicSubscriptions() {
   mqttClient.subscribe(topics.appDispatchTopic, 1);
   mqttClient.subscribe(topics.appReconfigTopic, 1);
+  mqttClient.subscribe(topics.reportRequestTopic, 1);
+
   mqttClient.onMessage(onMqttMessage);
   Serial.println("[MQTT] Subscriptions applied.");
+
+  // Inform the VTN that the VEN has been provisioned and enrolled
+  publishEnrollmentReport();
 }
 
 // MQTT Message handler
@@ -947,6 +1052,10 @@ void onMqttMessage(int messageSize) {
     }
     return;
   }
+  if (topic == topics.reportRequestTopic) {
+    parseReportRequest(payloadStr.c_str());
+    return;
+  } 
   Serial.print("[MQTT] No handler registered for topic: ");
   Serial.println(topic);
 }
@@ -1130,6 +1239,8 @@ void handleParsedCommand(const ParsedCommand &cmd, CommandSource source) {
       Serial.print("[COMMAND] Source "); Serial.print(source);
       Serial.print(" asserted event '"); Serial.print(cmd.eventId);
       Serial.print("' value="); Serial.println(cmd.dispatchValue);
+
+      publishEventStatusReport(source);
       break;
     }
 
@@ -1194,6 +1305,191 @@ void resolveDispatchAuthority() {
   Serial.print(") -> dispatchGen="); Serial.println(dispatchGen ? "true" : "false");
 }
 
-// -- App Telemetry Functions -----------------
+// -- App Reporting Functions -----------------
+
+// Used to build an enrollment report initiated by the Opta
+void publishEnrollmentReport() {
+  ReportMessage report;
+  if (!buildEnrollmentReport(report)) {
+    return;
+  }
+
+  static char reportBuffer[REPORT_BUFFER_SIZE];
+  size_t written;
+  if (!serializeReportToJson(report, APP_REPORT, reportBuffer, REPORT_BUFFER_SIZE, written)) {
+    return;
+  }
+
+  mqttClient.beginMessage(topics.reportTopic, false, 0);
+  mqttClient.write((const uint8_t*)reportBuffer, written);
+  mqttClient.endMessage();
+
+  Serial.println("[REPORT] Published enrollment report.");
+} 
+
+// Used to build an event report initiated by the Opta
+void publishEventStatusReport(CommandSource source) {
+  ReportMessage report;
+  if (!buildEventStatusReport(report, source)) {
+    return;
+  }
+
+  static char reportBuffer[REPORT_BUFFER_SIZE];
+  size_t written;
+  if (!serializeReportToJson(report, APP_REPORT, reportBuffer, REPORT_BUFFER_SIZE, written)) {
+    return;
+  }
+
+  mqttClient.beginMessage(topics.reportTopic, false, 0);
+  mqttClient.write((const uint8_t*)reportBuffer, written);
+  mqttClient.endMessage();
+
+  Serial.print("[REPORT] Published event status report for source ");
+  Serial.println(source);
+}
+
+// Parses a report request and initiates building and sending the reports
+void parseReportRequest(const char* payloadStr) {
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, payloadStr);
+  if (err) {
+    Serial.print("[REPORT] Request JSON error: ");
+    Serial.println(err.c_str());
+    return;
+  }
+
+  const char* requestType = doc["requestType"];
+  if (requestType == nullptr || strcmp(requestType, "eventStatus") != 0) {
+    Serial.println("[REPORT] Unrecognized or missing requestType, ignoring request.");
+    return;
+  }
+
+  for (int i = 0; i < NUM_SOURCES; i++) {
+    publishEventStatusReport((CommandSource)i);
+  }
+}
+
+// Builds the enrollment and identity announcement report
+bool buildEnrollmentReport(ReportMessage &report) {
+  strncpy(report.reportName, "enrollmentReport", MAX_REPORTNAME_LEN - 1);
+  report.reportName[MAX_REPORTNAME_LEN - 1] = '\0';
+
+  strncpy(report.clientName, registration.venId, MAX_CLIENTNAME_LEN - 1);
+  report.clientName[MAX_CLIENTNAME_LEN - 1] = '\0';
+
+  report.hasEventID = false;
+  report.eventID[0] = '\0';
+
+  report.resourceCount = registration.resourceCount;
+  if (report.resourceCount > MAX_RESOURCES) {
+    Serial.println("[REPORT] WARNING: resourceCount exceeds MAX_RESOURCES, truncating.");
+    report.resourceCount = MAX_RESOURCES;
+  }
+
+  for (uint8_t i = 0; i < report.resourceCount; i++) {
+    strncpy(report.resourceEntries[i].resourceName,
+            registration.resources[i].name,
+            MAX_RESOURCEID_LEN- 1);
+    report.resourceEntries[i].resourceName[MAX_RESOURCEID_LEN- 1] = '\0';
+    report.resourceEntries[i].hasIntervalData = false;
+  }
+
+  if (report.resourceCount == 0) {
+    Serial.println("[REPORT] WARNING: building enrollment report with zero configured resources.");
+  }
+  return true;
+}
+
+// Builds the event reports based on the given source's CommandSlot state
+bool buildEventStatusReport(ReportMessage &report, CommandSource source) {
+  const CommandSlot &slot = sources[source];
+
+  if (!slot.active) {
+    return false;
+  }
+
+  if (registration.resourceCount == 0) {
+    Serial.println("[REPORT] Cannot build event status report: no resources configured.");
+    return false;
+  }
+
+  strncpy(report.reportName, "eventStatusReport", MAX_REPORTNAME_LEN - 1);
+  report.reportName[MAX_REPORTNAME_LEN - 1] = '\0';
+
+  strncpy(report.clientName, registration.venId, MAX_CLIENTNAME_LEN - 1);
+  report.clientName[MAX_CLIENTNAME_LEN - 1] = '\0';
+
+  report.hasEventID = true;
+  strncpy(report.eventID, slot.eventId, MAX_EVENTID_LEN - 1);
+  report.eventID[MAX_EVENTID_LEN - 1] = '\0';
+
+  // ToDo: every event status report currently
+  // describes resources[0] specifically, since this device controls
+  // exactly one relay. If EntWise ever controls multiple resources per
+  // Opta, this needs to change to know which specific resource a given
+  // command actually targets -- there's no such association tracked
+  // anywhere yet (CommandSlot has no resource reference of its own).
+  report.resourceCount = 1;
+  strncpy(report.resourceEntries[0].resourceName,
+          registration.resources[0].name,
+          MAX_RESOURCEID_LEN- 1);
+  report.resourceEntries[0].resourceName[MAX_RESOURCEID_LEN- 1] = '\0';
+  report.resourceEntries[0].hasIntervalData = true;
+  report.resourceEntries[0].payloadValue = slot.dispatchValue;
+
+  return true;
+}
+
+// Serializes a ReportMessage into JSON using the given field-name map.
+bool serializeReportToJson(const ReportMessage &report, const OpenADR3ReportFields &fields,
+                            char* buffer, size_t bufSize, size_t &bytesWritten) {
+  JsonDocument doc;
+
+  doc[fields.reportName] = report.reportName;
+  doc[fields.clientName] = report.clientName;
+
+  if (report.hasEventID) {
+    doc[fields.eventID] = report.eventID;
+  }
+  // eventID key omitted entirely when !hasEventID
+
+  JsonArray resourcesArr = doc[fields.resources].to<JsonArray>();
+
+  if (report.resourceCount > MAX_RESOURCES) {
+    Serial.println("[REPORT] WARNING: resourceCount exceeds MAX_RESOURCES, truncating output.");
+  }
+  uint8_t count = (report.resourceCount > MAX_RESOURCES) ? MAX_RESOURCES : report.resourceCount;
+
+  for (uint8_t i = 0; i < count; i++) {
+    const ReportResourceEntry &entry = report.resourceEntries[i];
+    JsonObject resourceObj = resourcesArr.add<JsonObject>();
+    resourceObj[fields.resourceName] = entry.resourceName;
+
+    if (entry.hasIntervalData) {
+      JsonArray intervalsArr = resourceObj[fields.interval].to<JsonArray>();
+      JsonObject intervalObj = intervalsArr.add<JsonObject>();
+      intervalObj[fields.intervalId] = 0;   // ToDo: extend to multiple intervals when scheduler exists
+
+      JsonArray payloadsArr = intervalObj[fields.payload].to<JsonArray>();
+      JsonObject payloadObj = payloadsArr.add<JsonObject>();
+      payloadObj[fields.payloadType] = PAYLOAD_TYPE_SIMPLE;
+
+      JsonArray valuesArr = payloadObj[fields.payloadValue].to<JsonArray>();
+      valuesArr.add(entry.payloadValue);
+    }
+    // No intervals/payloads key at all when !hasIntervalData -- matches
+    // the enrollment report's identity-only resource entries.
+  }
+
+  bytesWritten = serializeJson(doc, buffer, bufSize);
+  if (bytesWritten == 0 || bytesWritten >= bufSize) {
+    Serial.println("[REPORT] Serialized report too large for buffer, aborting.");
+    return false;
+  }
+
+  return true;
+}
+
+
 
 // -- Data Conversion Functions ---------------
